@@ -1,0 +1,587 @@
+import os
+import logging
+import re
+import ollama  # Использование библиотеки ollama
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, File
+from aiogram.utils import executor
+import openai
+from typing import Optional, Dict
+import json
+import psycopg2
+from psycopg2 import sql
+from pathlib import Path
+import whisper
+from pydub import AudioSegment
+
+
+#______________________________________________________________________
+#DARTABASE
+
+# Конфигурация подключения к PostgreSQL
+DB_NAME = "englishschoolai"
+DB_USER = "dezmoond"
+DB_PASSWORD = "3621393258lL"
+DB_HOST = "localhost"
+DB_PORT = "5432"  # по умолчанию
+
+# Создание базы данных и таблиц
+def setup_database():
+    conn = psycopg2.connect(dbname='postgres', user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    # Создаем базу данных, если её нет
+    cur.execute(f"SELECT 1 FROM pg_database WHERE datname = '{DB_NAME}'")
+    if not cur.fetchone():
+        cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(DB_NAME)))
+    cur.close()
+    conn.close()
+
+    # Подключение к целевой базе
+    conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+    cur = conn.cursor()
+
+    # Таблицы
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT UNIQUE,  -- Телеграм ID пользователя
+    name VARCHAR(100),
+    email VARCHAR(100) UNIQUE,
+    start_date DATE DEFAULT CURRENT_DATE,
+    interests TEXT,
+    gender VARCHAR(10)
+);
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS daily_analysis (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,  -- Ссылаемся на user_id
+    analysis_date DATE DEFAULT CURRENT_DATE,
+    cefr_level VARCHAR(10),
+    read_level VARCHAR(100),
+    recommendations TEXT,
+    key_mistakes JSONB,
+    total_words INTEGER,
+    unique_words INTEGER,
+    inversions INTEGER,
+    participles INTEGER,
+    gerunds INTEGER,
+    spelling_errors INTEGER,
+    grammar_errors INTEGER,
+    syntax_errors INTEGER
+);
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS weekly_analysis (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,  -- Ссылаемся на user_id
+    week_number INTEGER,
+    month INTEGER,
+    year INTEGER,
+    avg_cefr_level VARCHAR(10),
+    read_level VARCHAR(100),
+    recommendations TEXT,
+    key_mistakes JSONB,
+    total_words INTEGER,
+    unique_words INTEGER,
+    inversions INTEGER,
+    participles INTEGER,
+    gerunds INTEGER,
+    spelling_errors INTEGER,
+    grammar_errors INTEGER,
+    syntax_errors INTEGER
+);""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS monthly_analysis (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,  -- Ссылаемся на user_id
+    month INTEGER,
+    year INTEGER,
+    avg_cefr_level VARCHAR(10),
+    read_level VARCHAR(100),
+    recommendations TEXT,
+    key_mistakes JSONB,
+    total_words INTEGER,
+    unique_words INTEGER,
+    inversions INTEGER,
+    participles INTEGER,
+    gerunds INTEGER,
+    spelling_errors INTEGER,
+    grammar_errors INTEGER,
+    syntax_errors INTEGER
+);""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS yearly_analysis (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,  -- Ссылаемся на user_id
+    year INTEGER,
+    avg_cefr_level VARCHAR(10),
+    read_level VARCHAR(100),
+    recommendations TEXT,
+    key_mistakes JSONB,
+    total_words INTEGER,
+    unique_words INTEGER,
+    inversions INTEGER,
+    participles INTEGER,
+    gerunds INTEGER,
+    spelling_errors INTEGER,
+    grammar_errors INTEGER,
+    syntax_errors INTEGER
+);""")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+#_____________________________________________________________________
+# Конфигурация
+API_TOKEN = '7935445281:AAFNhbIuOtDGhqZJlitA4T_sU5Ytx0tIIog'
+USE_OLLAMA = True  # Переключение между сервисами
+OLLAMA_MODEL = "llama3.2-vision:latest"  # Используемая модель в ollama, например "mistral" или "llama2"
+
+# Раскомментировать для использования OpenAI
+# OPENAI_API_KEY = 'your-openai-key'
+# openai.api_key = OPENAI_API_KEY
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+whisper_model = whisper.load_model("base")  # или tiny / small / medium
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+user_messages = {}
+
+# Кнопка для оценки уровня
+keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+button = KeyboardButton("Оценить уровень")
+keyboard.add(button)
+
+CEFR_LEVELS = {
+    "A": "Начальный",
+    "B": "Средний",
+    "C": "Продвинутый"
+}
+
+#_______________________________________________________________
+#voice
+
+#async def voice_analyze_with_ollama(text: str) -> str:
+#    """Анализ произношения через Ollama"""
+#    prompt = f"""
+#<s>[INST] Ты эксперт по произношению английского языка. Проанализируй текст, распознанный из речи:
+#
+#{text}
+#
+#1. Оцени:
+#   - Есть ли признаки плохого произношения (укажи конкретные слова)
+#   - Наличие неестественных слов или конструкций
+#   - Уровень понимания (1-10)
+#
+#2. Дай рекомендации по улучшению:
+#   - Какие звуки нужно тренировать
+#   - Какие слова произносятся неправильно
+#   - Советы по интонации и ритму
+#
+#3. Формат ответа:
+#   - Четкий список проблем
+#   - Конкретные упражнения
+#   - Оценка понятности [/INST]
+#"""
+#    try:
+#        response = ollama.chat(model=OLLAMA_MODEL, messages=[{"role": "user", "content": prompt}])
+#        return response['message'].get('content', 'Не удалось проанализировать произношение')
+#    except Exception as e:
+#        logger.error(f"Voice analysis error: {str(e)}")
+#        return f"Ошибка анализа произношения: {str(e)}"
+#
+
+# Функция сохранения файла
+async def handle_file(file: File, file_name: str, path: str):
+    try:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        destination_path = os.path.join(path, file_name)
+        logger.info(f"[handle_file] Создание директории: {path}")
+        logger.info(f"[handle_file] Путь сохранения файла: {destination_path}")
+
+        file_stream = await bot.download_file(file.file_path)
+        logger.info(f"[handle_file] Файл получен с file_path: {file.file_path}")
+
+        with open(destination_path, "wb") as f:
+            f.write(file_stream.read())
+        logger.info(f"[handle_file] Файл успешно сохранён: {destination_path}")
+
+        return destination_path
+    except Exception as e:
+        logger.error(f"[handle_file] Ошибка при сохранении файла: {str(e)}")
+        raise
+
+
+
+def convert_ogg_to_wav(ogg_path: str) -> str:
+    wav_path = ogg_path.replace(".ogg", ".wav")
+    try:
+        sound = AudioSegment.from_file(ogg_path, format="ogg")
+        sound.export(wav_path, format="wav")
+        return wav_path
+    except Exception as e:
+        logger.error(f"[convert_ogg_to_wav] Ошибка при конвертации: {e}")
+        return None
+
+# Хендлер голосовых сообщений
+@dp.message_handler(content_types=types.ContentType.VOICE)
+async def handle_voice(message: types.Message):
+    ogg_path = None
+    try:
+        user_id = message.from_user.id
+        file_id = message.voice.file_id
+        logger.info(f"[handle_voice] ▶️ Получено голосовое сообщение от пользователя {user_id}, file_id: {file_id}")
+
+        file: File = await bot.get_file(file_id)
+        logger.info(f"[handle_voice] 📥 Информация о файле получена: {file.file_path}")
+
+        voice_dir = "voices"
+        ogg_name = f"audio_{user_id}_{message.message_id}.ogg"
+        logger.info(f"[handle_voice] 📄 Генерируем имя файла: {ogg_name}")
+
+        ogg_path = await handle_file(file=file, file_name=ogg_name, path=voice_dir)
+
+        if not os.path.exists(ogg_path):
+            logger.warning(f"[handle_voice] ❌ Файл не найден после сохранения: {ogg_path}")
+            await message.reply("❌ Не удалось сохранить голосовое сообщение.")
+            return
+
+        ogg_path = os.path.abspath(ogg_path).replace("\\", "/")
+        logger.info(f"[handle_voice] ✅ Файл успешно сохранён: {ogg_path}")
+
+        # Транскрипция через Whisper
+        logger.info(f"[handle_voice] 🧠 Запуск транскрипции файла: {ogg_path}")
+        result = whisper_model.transcribe(ogg_path)
+        recognized_text = result.get("text", "").strip()
+        logger.info(f"[handle_voice] 📜 Результат транскрипции: {recognized_text}")
+
+        if not recognized_text:
+            logger.warning(f"[handle_voice] ⚠️ Пустой результат после транскрипции.")
+            await message.reply("❌ Не удалось распознать текст.")
+            return
+
+        user_messages.setdefault(user_id, []).append(recognized_text)
+        await message.reply(f"💬 Ваш текст:\n\n{recognized_text}")
+
+        ## Анализ произношения
+        #logger.info(f"[handle_voice] 🧑‍🏫 Запуск анализа произношения через Ollama...")
+        #pronunciation_feedback = await voice_analyze_with_ollama(recognized_text)
+        #await message.reply(f"🔊 Анализ произношения:\n\n{pronunciation_feedback}")
+        #logger.info(f"[handle_voice] ✅ Анализ произношения завершён.")
+#
+        ## Текстовый анализ
+        #logger.info(f"[handle_voice] 📊 Выполняем текстовый анализ...")
+        #analysis, text_analysis = await get_analysis(recognized_text)
+        #if text_analysis:
+        #    await message.reply(f"📝 Текстовый анализ:\n\n{text_analysis}")
+        #    logger.info(f"[handle_voice] ✅ Текстовый анализ отправлен.")
+
+    except Exception as e:
+        logger.exception(f"[handle_voice] 💥 Ошибка при обработке голосового сообщения: {e}")
+        await message.reply("⚠️ Произошла ошибка при обработке вашего голосового сообщения.")
+
+    finally:
+        if ogg_path and os.path.exists(ogg_path):
+            try:
+                os.remove(ogg_path)
+                logger.info(f"[handle_voice] 🧹 Файл удалён после обработки: {ogg_path}")
+            except Exception as e:
+                logger.error(f"[handle_voice] ❗ Ошибка при удалении файла {ogg_path}: {e}")
+
+
+
+#____________________________________________________________________________________
+async def analyze_with_ollama(text: str) -> tuple[Optional[Dict], Optional[str]]:
+    """Анализ через локальную модель Ollama"""
+    try:
+        # Подсчет статистики
+        total_words = len(text.split())
+        unique_words = len(set(text.split()))
+        sentences = re.split(r'[.!?]', text)  # Разделяем текст на предложения
+        avg_sentence_length = sum(len(sentence.split()) for sentence in sentences) / len(sentences) if sentences else 0
+
+        # Сложные конструкции
+        conditional_sentences = len(re.findall(r"\b(if|unless|provided that)\b", text))  # Условные предложения
+        inversions = len(re.findall(r"\b(had|should|were|do)\b.*\b(subject)\b", text))  # Инверсии
+        participles = len(re.findall(r"\b(\w+ing)\b", text))  # Причастия
+        gerunds = len(re.findall(r"\b(\w+ing)\b", text))  # Герундии
+
+        # Формируем запрос
+        prompt = f"""<s>[INST] Ты эксперт в анализе уровней английского языка. Анализируй текст и:
+    1. Уровень CEFR (только A, B или C):
+   - A: Базовый (простые фразы, ограниченный словарь)
+   - B: Самостоятельный (может общаться на повседневные темы)
+   - C: Профессиональный (свободное владение, сложные конструкции)
+
+    2. Уровень читаемости для А B С(по шкале):
+   ответ одно значение: 1 или 2
+3. Анализ орфографических ошибок английского языка, Неправильное написание слов
+4. Анализ грамматических ошибок английского языка, Ошибки в глаголах, артиклях, временах
+5. Анализ синтаксические ошибок английского языка, Неправильный порядок слов, согласование
+4. Детализация:
+   - Для CEFR учитывай: 
+     * Длина предложений
+     * Разнообразие грамматических структур
+     * Лексическое богатство
+   - Каждую ошибку маркируй точным типом
+   
+Формат только как VALID JSON only:
+{{
+    "cefr_level": "B",
+    "read_level": "понятный текст, сложно понимаемый текст",
+    "error_types": ["орфографическиe", "грамматические", "синтаксические"],
+    "recommendations": ["...", "...", "..."],
+    "key_mistakes": [
+        {{"error": "...", "example": "...", "correction": "..."}}
+    ],
+    "statistics": {{
+        "total_words": {total_words},
+        "unique_words": {unique_words},
+        "average_sentence_length": {avg_sentence_length},
+        "conditional_sentences": {conditional_sentences},
+        "inversions": {inversions},
+        "participles": {participles},
+        "gerunds": {gerunds}
+    }}
+}} 
+Text: {text} [/INST]"""
+
+        # Используем ollama для генерации анализа
+        response = ollama.chat(model=OLLAMA_MODEL, messages=[{"role": "user", "content": prompt}])
+        print(response)
+
+        # Проверяем, если ответ содержит ключ 'message'
+        if 'message' not in response:
+            logger.error(f"Ollama Response Error: No 'message' key found in response.")
+            return None, None
+
+        # Извлекаем содержимое из 'message' -> 'content'
+        message_content = response['message'].get('content', '')
+        if not message_content:
+            logger.error(f"Ollama Response Error: 'content' field is empty.")
+            return None, None
+
+        # Преобразуем строку JSON в объект Python
+        try:
+            analysis = json.loads(message_content)
+        except json.JSONDecodeError as e:
+            logger.error(f"Невалидный JSON от Ollama: {e}")
+            logger.error(f"Полученный контент: {message_content}")
+            return None, None
+
+        # Проверка обязательных полей
+        required_fields = ['cefr_level', 'read_level', 'key_mistakes', 'recommendations', 'statistics']
+        for field in required_fields:
+            if field not in analysis:
+                logger.error(f"Отсутствует обязательное поле: {field}")
+                return None, None
+
+        # Формируем ответ для отправки в Telegram
+        cefr_level = analysis.get('cefr_level', 'Неизвестно')
+        read_level = analysis.get('read_level', 'Неизвестно')
+        key_mistakes = analysis.get('key_mistakes', [])
+        recommendations = analysis.get('recommendations', [])
+
+        reply_message = f"🔍 **Оценка уровня:** {cefr_level}\n\n"
+        reply_message += f"Уровень читаемости: {read_level}\n\n"
+        reply_message += "💡 **Рекомендации:**\n"
+        for rec in recommendations:
+            reply_message += f" - {rec}\n"
+
+        reply_message += "\n✍️ **Ключевые ошибки:**\n"
+        for mistake in key_mistakes:
+            reply_message += f" - Ошибка: {mistake['error']}\n"
+            reply_message += f"   Пример: {mistake['example']}\n"
+            reply_message += f"   Исправление: {mistake['correction']}\n"
+
+        reply_message += "\n📊 **Статистика текста:**\n"
+        stats = analysis.get('statistics', {})
+        reply_message += f" - Всего слов: {stats.get('total_words', 0)}\n"
+        reply_message += f" - Уникальные слова: {stats.get('unique_words', 0)}\n"
+        reply_message += f" - Средняя длина предложения: {stats.get('average_sentence_length', 0)} слов\n"
+        reply_message += f" - Условные предложения: {stats.get('conditional_sentences', 0)}\n"
+        reply_message += f" - Инверсии: {stats.get('inversions', 0)}\n"
+        reply_message += f" - Причастия: {stats.get('participles', 0)}\n"
+        reply_message += f" - Герундии: {stats.get('gerunds', 0)}\n"
+
+        return analysis, reply_message
+
+    except Exception as e:
+        logger.error(f"Ollama Error: {e}")
+        return None, None
+
+async def analyze_with_openai(text: str) -> Optional[str]:
+    """Анализ через OpenAI API"""
+    try:
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "system",
+                "content": """Тот же промпт что и раньше..."""
+            }, {
+                "role": "user",
+                "content": text
+            }],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        return response.choices[0].message['content']  # Возвращаем контент из ответа
+    except Exception as e:
+        logger.error(f"OpenAI Error: {e}")
+        return None
+
+async def get_analysis(text: str) -> tuple[Optional[Dict], Optional[str]]:
+    """Роутер для выбора сервиса анализа"""
+    if USE_OLLAMA:
+        return await analyze_with_ollama(text)
+    else:
+        # Note: You'll need to modify analyze_with_openai similarly if you use it
+        analysis = await analyze_with_openai(text)
+        return None, analysis  # Assuming OpenAI returns just the text
+
+@dp.message_handler(commands=['start'])
+async def start(message: types.Message):
+    """Приветственное сообщение и кнопка для анализа"""
+    await message.answer("Привет! Напиши несколько сообщений на английском, чтобы я мог оценить твой уровень.", reply_markup=keyboard)
+
+@dp.message_handler(lambda message: message.text != "Оценить уровень")
+async def collect_user_message(message: types.Message):
+    """Сохранение сообщений пользователей для анализа"""
+    user_id = message.from_user.id
+    text = message.text
+
+    # Добавляем сообщение в список сообщений пользователя
+    if user_id not in user_messages:
+        user_messages[user_id] = []  # Если еще нет, создаем новый список
+    user_messages[user_id].append(text)
+
+    await message.reply("💬 Ваше сообщение сохранено для анализа.")
+
+@dp.message_handler(text="Оценить уровень")
+async def evaluate_level(message: types.Message):
+    """Оценка уровня языка пользователя"""
+    user_id = message.from_user.id
+    if not (messages := user_messages.get(user_id, [])):
+        await message.reply("❌ Нет данных для анализа. Напишите несколько сообщений.")
+        return
+
+    full_text = " ".join(messages)
+    if not re.search(r'[a-zA-Z]', full_text):
+        await message.reply("🔠 Пожалуйста, напишите текст на английском.")
+        return
+
+    # Используем get_analysis вместо прямого вызова analyze_with_ollama
+    analysis, reply_text = await get_analysis(full_text)
+    if not analysis or not reply_text:
+        await message.reply("Произошла ошибка анализа.")
+        return
+
+    # Сохраняем анализ в базу данных
+    try:
+        save_user_and_analysis(user_id, message.from_user.full_name, analysis)
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении в БД: {e}")
+        await message.reply("❌ Ошибка при обработке результата анализа.")
+
+    # Отправляем ответ пользователю
+    await message.reply(reply_text)
+
+
+def save_user_and_analysis(user_id, name, analysis_dict):
+    if not analysis_dict:
+        logger.error("Пустой анализ для сохранения")
+        return
+
+    try:
+        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+        cur = conn.cursor()
+
+        # Проверка и добавление пользователя
+        cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+        if not cur.fetchone():
+            cur.execute(
+                "INSERT INTO users (user_id, name) VALUES (%s, %s)",
+                (user_id, name)
+            )
+
+        # Инициализация счетчиков ошибок
+        spelling_errors = 0
+        grammar_errors = 0
+        syntax_errors = 0
+
+        # 1. Подсчет ошибок из key_mistakes
+        if isinstance(analysis_dict.get('key_mistakes'), list):
+            for mistake in analysis_dict['key_mistakes']:
+                error_type = mistake.get('type', '').lower()
+                if error_type == 'spelling':
+                    spelling_errors += 1
+                elif error_type == 'grammar':
+                    grammar_errors += 1
+                elif error_type == 'syntax':
+                    syntax_errors += 1
+
+        # 2. Дополнительный подсчет из error_types (если нужно)
+        if isinstance(analysis_dict.get('error_types'), list):
+            for error_type in analysis_dict['error_types']:
+                error_type = error_type.lower()
+                if 'spelling' in error_type or 'орфограф' in error_type:
+                    spelling_errors += 1
+                elif 'grammar' in error_type or 'граммат' in error_type:
+                    grammar_errors += 1
+                elif 'syntax' in error_type or 'синтакс' in error_type:
+                    syntax_errors += 1
+
+        # Получение статистики
+        stats = analysis_dict.get('statistics', {})
+
+        # Сохраняем анализ в базу
+        cur.execute("""
+            INSERT INTO daily_analysis (
+                user_id, analysis_date, cefr_level, read_level,
+                recommendations, key_mistakes, total_words, unique_words,
+                inversions, participles, gerunds, spelling_errors,
+                grammar_errors, syntax_errors
+            ) VALUES (
+                %s, CURRENT_DATE, %s, %s, %s, %s::jsonb,
+                %s, %s, %s, %s, %s, %s, %s, %s
+            )
+        """, (
+            user_id,
+            analysis_dict.get('cefr_level', 'Unknown'),
+            analysis_dict.get('read_level', 'Unknown'),
+            "\n".join(analysis_dict.get('recommendations', [])),
+            json.dumps(analysis_dict.get('key_mistakes', [])),
+            stats.get('total_words', 0),
+            stats.get('unique_words', 0),
+            stats.get('inversions', 0),
+            stats.get('participles', 0),
+            stats.get('gerunds', 0),
+            spelling_errors,  # Явно передаем количество ошибок
+            grammar_errors,
+            syntax_errors
+        ))
+
+        conn.commit()
+        logger.info(f"Сохранен анализ для user_id={user_id}. Ошибки: spelling={spelling_errors}, grammar={grammar_errors}, syntax={syntax_errors}")
+        # Очищаем сохраненные сообщения пользователя после анализа
+        if user_id in user_messages:
+            del user_messages[user_id]
+            logger.info(f"Сообщения пользователя {user_id} очищены")
+    except Exception as e:
+        logger.error(f"Ошибка базы данных: {e}", exc_info=True)
+        if conn: conn.rollback()
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+if __name__ == '__main__':
+    setup_database()
+    logger.info("Бот запущен")
+    executor.start_polling(dp, skip_updates=True)
